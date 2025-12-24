@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-rsscli.py - Minimal RSS reader with:
-- SQLite persistence (feeds + entries)
-- CLI: add/list/fetch/updates
-- Python API: RSSStore.fetch_all(), RSSStore.get_updates_for_day(), RSSStore.fetch_and_get_updates_for_day()
+rsscli.py - SQLite-backed RSS reader with:
+- Feeds + entries persisted
+- Categories for feeds
+- Fetch updates and store deduped entries
+- Query updates by day
+- Full-text search (FTS5) on title/summary/content (with fallback to LIKE)
 
 Dependency:
   pip install feedparser
@@ -113,10 +115,10 @@ class Entry:
 
 
 # -----------------------------
-# SQLite store / API
+# SQLite schema
 # -----------------------------
 
-SCHEMA_SQL = """
+SCHEMA_BASE_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -151,9 +153,59 @@ CREATE INDEX IF NOT EXISTS idx_entries_fetched_at   ON entries(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_feeds_category       ON feeds(category);
 """
 
+# FTS is created separately so we can safely fall back if SQLite lacks FTS5.
+SCHEMA_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+  title,
+  summary,
+  content,
+  entry_id UNINDEXED,
+  feed_id  UNINDEXED,
+  published_at UNINDEXED,
+  fetched_at   UNINDEXED
+);
+
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO entries_fts(entry_id, feed_id, published_at, fetched_at, title, summary, content)
+  VALUES (
+    new.id,
+    new.feed_id,
+    new.published_at,
+    new.fetched_at,
+    COALESCE(new.title, ''),
+    COALESCE(new.summary, ''),
+    COALESCE(new.content, '')
+  );
+END;
+
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+  DELETE FROM entries_fts WHERE entry_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+  DELETE FROM entries_fts WHERE entry_id = old.id;
+  INSERT INTO entries_fts(entry_id, feed_id, published_at, fetched_at, title, summary, content)
+  VALUES (
+    new.id,
+    new.feed_id,
+    new.published_at,
+    new.fetched_at,
+    COALESCE(new.title, ''),
+    COALESCE(new.summary, ''),
+    COALESCE(new.content, '')
+  );
+END;
+"""
+
+
+# -----------------------------
+# SQLite store / API
+# -----------------------------
+
 class RSSStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._fts_enabled = False
         self._init_db()
 
     @contextmanager
@@ -170,12 +222,21 @@ class RSSStore:
     def _init_db(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
         with self._conn() as conn:
-            conn.executescript(SCHEMA_SQL)
-            # migration for existing DBs that were created before "category"
+            conn.executescript(SCHEMA_BASE_SQL)
+
+            # Migration for existing DBs that were created before "category"
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(feeds)").fetchall()}
             if "category" not in cols:
                 conn.execute("ALTER TABLE feeds ADD COLUMN category TEXT NOT NULL DEFAULT 'default'")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_feeds_category ON feeds(category)")
+
+            # Try enable FTS5
+            try:
+                conn.executescript(SCHEMA_FTS_SQL)
+                self._fts_enabled = True
+            except sqlite3.OperationalError:
+                # FTS5 not available in this SQLite build
+                self._fts_enabled = False
 
     # ---- Feeds ----
 
@@ -195,7 +256,10 @@ class RSSStore:
                 "UPDATE feeds SET category = COALESCE(NULLIF(?, ''), category) WHERE url = ?",
                 (category, url),
             )
-            row = conn.execute("SELECT id, url, title, category FROM feeds WHERE url = ?", (url,)).fetchone()
+            row = conn.execute(
+                "SELECT id, url, title, category FROM feeds WHERE url = ?",
+                (url,),
+            ).fetchone()
             if not row:
                 raise RuntimeError("Failed to insert/feed lookup.")
             return Feed(id=int(row["id"]), url=str(row["url"]), title=row["title"], category=str(row["category"]))
@@ -327,6 +391,101 @@ class RSSStore:
         self.fetch_all()
         return self.get_updates_for_day(day, use_published_at=use_published_at)
 
+    # ---- Search ----
+
+    def search(self, query: str, limit: int = 50, category: Optional[str] = None) -> List[Entry]:
+        """
+        Full-text search (FTS5) on title/summary/content.
+        If FTS5 is not available, falls back to LIKE search on (title OR summary).
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        limit = max(1, min(int(limit), 500))
+
+        if self._fts_enabled:
+            return self._search_fts(q, limit=limit, category=category)
+        return self._search_like(q, limit=limit, category=category)
+
+    def _search_fts(self, q: str, limit: int, category: Optional[str]) -> List[Entry]:
+        sql = """
+        SELECT
+          e.id, e.feed_id, e.guid, e.title, e.link, e.author, e.published_at, e.summary, e.content, e.fetched_at
+        FROM entries_fts f
+        JOIN entries e ON e.id = f.entry_id
+        JOIN feeds   d ON d.id = e.feed_id
+        WHERE f MATCH ?
+        {cat_filter}
+        ORDER BY bm25(f) ASC, COALESCE(e.published_at, e.fetched_at) DESC
+        LIMIT ?
+        """
+
+        cat_filter = ""
+        params: List[Any] = [q]
+        if category:
+            cat_filter = "AND d.category = ?"
+            params.append(category)
+
+        params.append(limit)
+
+        with self._conn() as conn:
+            rows = conn.execute(sql.format(cat_filter=cat_filter), params).fetchall()
+            return [
+                Entry(
+                    id=int(r["id"]),
+                    feed_id=int(r["feed_id"]),
+                    guid=str(r["guid"]),
+                    title=r["title"],
+                    link=r["link"],
+                    author=r["author"],
+                    published_at=r["published_at"],
+                    summary=r["summary"],
+                    content=r["content"],
+                    fetched_at=str(r["fetched_at"]),
+                )
+                for r in rows
+            ]
+
+    def _search_like(self, q: str, limit: int, category: Optional[str]) -> List[Entry]:
+        # basic fallback when FTS5 isn't available
+        like = f"%{q}%"
+        sql = """
+        SELECT
+          e.id, e.feed_id, e.guid, e.title, e.link, e.author, e.published_at, e.summary, e.content, e.fetched_at
+        FROM entries e
+        JOIN feeds d ON d.id = e.feed_id
+        WHERE (e.title LIKE ? OR e.summary LIKE ?)
+        {cat_filter}
+        ORDER BY COALESCE(e.published_at, e.fetched_at) DESC
+        LIMIT ?
+        """
+
+        cat_filter = ""
+        params: List[Any] = [like, like]
+        if category:
+            cat_filter = "AND d.category = ?"
+            params.append(category)
+        params.append(limit)
+
+        with self._conn() as conn:
+            rows = conn.execute(sql.format(cat_filter=cat_filter), params).fetchall()
+            return [
+                Entry(
+                    id=int(r["id"]),
+                    feed_id=int(r["feed_id"]),
+                    guid=str(r["guid"]),
+                    title=r["title"],
+                    link=r["link"],
+                    author=r["author"],
+                    published_at=r["published_at"],
+                    summary=r["summary"],
+                    content=r["content"],
+                    fetched_at=str(r["fetched_at"]),
+                )
+                for r in rows
+            ]
+
 
 # -----------------------------
 # CLI
@@ -384,6 +543,27 @@ def cmd_updates(args: argparse.Namespace) -> int:
             print(f"  {link}")
     return 0
 
+def cmd_search(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+
+    if args.fetch_first:
+        store.fetch_all()
+
+    results = store.search(args.query, limit=args.limit, category=args.category)
+
+    if not results:
+        print("No matches.")
+        return 0
+
+    for e in results:
+        when = e.published_at or e.fetched_at
+        title = (e.title or "").replace("\n", " ").strip()
+        link = e.link or ""
+        print(f"[{when}] feed={e.feed_id} {title}")
+        if link:
+            print(f"  {link}")
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rsscli", description="SQLite-backed RSS CLI")
     p.add_argument("--db", default=os.path.expanduser("~/.local/share/rsscli/rss.sqlite3"), help="Path to sqlite DB")
@@ -408,6 +588,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_updates.add_argument("--by-fetched", action="store_true", help="Filter by fetched_at date instead of published_at")
     p_updates.set_defaults(func=cmd_updates)
 
+    p_search = sub.add_parser("search", help="Full-text search in titles/summaries (FTS5 when available)")
+    p_search.add_argument("query", help='FTS query string, e.g. "python asyncio" or "kubernetes"')
+    p_search.add_argument("--limit", type=int, default=50, help="Max results (default: 50, max: 500)")
+    p_search.add_argument("--category", default=None, help="Filter by feed category")
+    p_search.add_argument("--fetch-first", action="store_true", help="Fetch before searching")
+    p_search.set_defaults(func=cmd_search)
+
     return p
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -417,4 +604,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
