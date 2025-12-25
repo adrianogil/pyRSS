@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-rsscli.py - SQLite-backed RSS reader with:
+pyrss.py - SQLite-backed RSS reader with:
 - Feeds + entries persisted
 - Categories for feeds
 - Fetch updates and store deduped entries
-- Query updates by day
+- Query updates by day or last N days
 - Full-text search (FTS5) on title/summary/content (with fallback to LIKE)
 
 Dependency:
@@ -19,7 +19,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import feedparser
@@ -31,6 +31,9 @@ import feedparser
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
 
 def parse_date_like(s: str) -> date:
     return date.fromisoformat(s)
@@ -153,7 +156,6 @@ CREATE INDEX IF NOT EXISTS idx_entries_fetched_at   ON entries(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_feeds_category       ON feeds(category);
 """
 
-# FTS is created separately so we can safely fall back if SQLite lacks FTS5.
 SCHEMA_FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
   title,
@@ -235,7 +237,6 @@ class RSSStore:
                 conn.executescript(SCHEMA_FTS_SQL)
                 self._fts_enabled = True
             except sqlite3.OperationalError:
-                # FTS5 not available in this SQLite build
                 self._fts_enabled = False
 
     # ---- Feeds ----
@@ -354,9 +355,30 @@ class RSSStore:
     # ---- Queries ----
 
     def get_updates_for_day(self, day: date, use_published_at: bool = True) -> List[Entry]:
-        day_start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
-        day_end = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+        start_dt = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+        end_dt = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
 
+        return self.get_updates_between(start_dt, end_dt, use_published_at=use_published_at)
+
+    def get_updates_last_days(self, days: int, use_published_at: bool = True) -> List[Entry]:
+        """
+        Returns entries from the last N days, inclusive (UTC).
+        Example: days=1 => only today (UTC).
+                 days=3 => today + previous 2 days (UTC).
+        """
+        days = int(days)
+        if days <= 0:
+            return []
+
+        end_day = utc_today()
+        start_day = end_day - timedelta(days=days - 1)
+
+        start_dt = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+        end_dt = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+
+        return self.get_updates_between(start_dt, end_dt, use_published_at=use_published_at)
+
+    def get_updates_between(self, start_iso: str, end_iso: str, use_published_at: bool = True) -> List[Entry]:
         col = "published_at" if use_published_at else "fetched_at"
         where = f"{col} IS NOT NULL AND {col} BETWEEN ? AND ?"
 
@@ -368,7 +390,7 @@ class RSSStore:
                 WHERE {where}
                 ORDER BY COALESCE(published_at, fetched_at) DESC
                 """,
-                (day_start, day_end),
+                (start_iso, end_iso),
             ).fetchall()
 
             return [
@@ -391,13 +413,13 @@ class RSSStore:
         self.fetch_all()
         return self.get_updates_for_day(day, use_published_at=use_published_at)
 
+    def fetch_and_get_updates_last_days(self, days: int, use_published_at: bool = True) -> List[Entry]:
+        self.fetch_all()
+        return self.get_updates_last_days(days, use_published_at=use_published_at)
+
     # ---- Search ----
 
     def search(self, query: str, limit: int = 50, category: Optional[str] = None) -> List[Entry]:
-        """
-        Full-text search (FTS5) on title/summary/content.
-        If FTS5 is not available, falls back to LIKE search on (title OR summary).
-        """
         q = (query or "").strip()
         if not q:
             return []
@@ -411,13 +433,13 @@ class RSSStore:
     def _search_fts(self, q: str, limit: int, category: Optional[str]) -> List[Entry]:
         sql = """
         SELECT
-          e.id, e.feed_id, e.guid, e.title, e.link, e.author, e.published_at, e.summary, e.content, e.fetched_at
-        FROM entries_fts f
-        JOIN entries e ON e.id = f.entry_id
+        e.id, e.feed_id, e.guid, e.title, e.link, e.author, e.published_at, e.summary, e.content, e.fetched_at
+        FROM entries_fts
+        JOIN entries e ON e.id = entries_fts.entry_id
         JOIN feeds   d ON d.id = e.feed_id
-        WHERE f MATCH ?
+        WHERE entries_fts MATCH ?
         {cat_filter}
-        ORDER BY bm25(f) ASC, COALESCE(e.published_at, e.fetched_at) DESC
+        ORDER BY bm25(entries_fts) ASC, COALESCE(e.published_at, e.fetched_at) DESC
         LIMIT ?
         """
 
@@ -447,8 +469,8 @@ class RSSStore:
                 for r in rows
             ]
 
+
     def _search_like(self, q: str, limit: int, category: Optional[str]) -> List[Entry]:
-        # basic fallback when FTS5 isn't available
         like = f"%{q}%"
         sql = """
         SELECT
@@ -491,6 +513,25 @@ class RSSStore:
 # CLI
 # -----------------------------
 
+def print_entries_grouped_by_day(entries: List[Entry]) -> None:
+    """
+    Nice output: adds a date header when the day changes.
+    Uses published_at if present, else fetched_at.
+    """
+    last_day: Optional[str] = None
+    for e in entries:
+        when = e.published_at or e.fetched_at
+        day = when[:10] if when else "????-??-??"
+        if day != last_day:
+            print(f"\n=== {day} ===")
+            last_day = day
+
+        title = (e.title or "").replace("\n", " ").strip()
+        link = e.link or ""
+        print(f"[{when}] feed={e.feed_id} {title}")
+        if link:
+            print(f"  {link}")
+
 def cmd_add(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
     feed = store.add_feed(args.url, category=args.category, title=None)
@@ -523,24 +564,24 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 def cmd_updates(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
-    day = parse_date_like(args.date)
+
+    use_published = not args.by_fetched
 
     if args.fetch_first:
-        entries = store.fetch_and_get_updates_for_day(day, use_published_at=not args.by_fetched)
+        store.fetch_all()
+
+    if args.date:
+        day = parse_date_like(args.date)
+        entries = store.get_updates_for_day(day, use_published_at=use_published)
     else:
-        entries = store.get_updates_for_day(day, use_published_at=not args.by_fetched)
+        # default behavior: last N days (default 1)
+        entries = store.get_updates_last_days(args.last, use_published_at=use_published)
 
     if not entries:
         print("No entries found.")
         return 0
 
-    for e in entries:
-        when = e.published_at or e.fetched_at
-        title = (e.title or "").replace("\n", " ").strip()
-        link = e.link or ""
-        print(f"[{when}] feed={e.feed_id} {title}")
-        if link:
-            print(f"  {link}")
+    print_entries_grouped_by_day(entries)
     return 0
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -555,18 +596,12 @@ def cmd_search(args: argparse.Namespace) -> int:
         print("No matches.")
         return 0
 
-    for e in results:
-        when = e.published_at or e.fetched_at
-        title = (e.title or "").replace("\n", " ").strip()
-        link = e.link or ""
-        print(f"[{when}] feed={e.feed_id} {title}")
-        if link:
-            print(f"  {link}")
+    print_entries_grouped_by_day(results)
     return 0
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="rsscli", description="SQLite-backed RSS CLI")
-    p.add_argument("--db", default=os.path.expanduser("~/.local/share/rsscli/rss.sqlite3"), help="Path to sqlite DB")
+    p = argparse.ArgumentParser(prog="pyrss", description="SQLite-backed RSS CLI")
+    p.add_argument("--db", default=os.path.expanduser("~/.local/share/pyrss/rss.sqlite3"), help="Path to sqlite DB")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -582,13 +617,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch = sub.add_parser("fetch", help="Fetch updates from all feeds and store in DB")
     p_fetch.set_defaults(func=cmd_fetch)
 
-    p_updates = sub.add_parser("updates", help="Show updates for a given day (UTC)")
-    p_updates.add_argument("--date", required=True, help="YYYY-MM-DD")
+    # updates: either --date or --last N (default 1)
+    p_updates = sub.add_parser("updates", help="Show updates for a day or from last N days (UTC)")
+    g = p_updates.add_mutually_exclusive_group(required=False)
+    g.add_argument("--date", help="YYYY-MM-DD (UTC)")
+    g.add_argument("--last", type=int, default=1, help="Last N days inclusive (UTC). Default: 1")
     p_updates.add_argument("--fetch-first", action="store_true", help="Fetch before querying")
-    p_updates.add_argument("--by-fetched", action="store_true", help="Filter by fetched_at date instead of published_at")
+    p_updates.add_argument("--by-fetched", action="store_true", help="Filter by fetched_at instead of published_at")
     p_updates.set_defaults(func=cmd_updates)
 
-    p_search = sub.add_parser("search", help="Full-text search in titles/summaries (FTS5 when available)")
+    p_search = sub.add_parser("search", help="Full-text search (FTS5 when available)")
     p_search.add_argument("query", help='FTS query string, e.g. "python asyncio" or "kubernetes"')
     p_search.add_argument("--limit", type=int, default=50, help="Max results (default: 50, max: 500)")
     p_search.add_argument("--category", default=None, help="Filter by feed category")
