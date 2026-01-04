@@ -270,6 +270,17 @@ class RSSStore:
             rows = conn.execute("SELECT id, url, title, category FROM feeds ORDER BY category, id").fetchall()
             return [Feed(int(r["id"]), str(r["url"]), r["title"], str(r["category"])) for r in rows]
 
+    def delete_feed(self, *, feed_id: Optional[int] = None, url: Optional[str] = None) -> int:
+        if feed_id is None and not url:
+            raise ValueError("Provide feed_id or url to delete.")
+
+        with self._conn() as conn:
+            if feed_id is not None:
+                cur = conn.execute("DELETE FROM feeds WHERE id = ?", (int(feed_id),))
+            else:
+                cur = conn.execute("DELETE FROM feeds WHERE url = ?", (url.strip(),))
+            return int(cur.rowcount)
+
     # ---- Fetching ----
 
     def fetch_all(self) -> Dict[str, Any]:
@@ -548,6 +559,15 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"{f.id}\t{f.category}\t{f.url}\t{f.title or ''}")
     return 0
 
+def cmd_delete(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+    deleted = store.delete_feed(feed_id=args.id, url=args.url)
+    if deleted == 0:
+        print("No matching feed found.")
+        return 1
+    print(f"Deleted {deleted} feed(s).")
+    return 0
+
 def cmd_fetch(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
     s = store.fetch_all()
@@ -613,6 +633,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="List registered feeds")
     p_list.set_defaults(func=cmd_list)
+
+    p_delete = sub.add_parser("delete", help="Delete a feed (and its entries)")
+    g_delete = p_delete.add_mutually_exclusive_group(required=True)
+    g_delete.add_argument("--id", type=int, help="Feed id to delete")
+    g_delete.add_argument("--url", help="Feed URL to delete")
+    p_delete.set_defaults(func=cmd_delete)
 
     p_fetch = sub.add_parser("fetch", help="Fetch updates from all feeds and store in DB")
     p_fetch.set_defaults(func=cmd_fetch)
