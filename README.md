@@ -150,4 +150,11 @@ Troubleshooting
 License
 ------------------------------------------------------------
 
-Choose a license (MIT/Apache-2.0/etc.) and put it in LICENSE.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+------------------------------------------------------------
+Contributing
+------------------------------------------------------------
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution
+guidelines.
