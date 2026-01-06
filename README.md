@@ -1,7 +1,7 @@
 pyRSS — SQLite-backed RSS reader (CLI + Python API)
 ===================================================
 
-rsscli is a small Python RSS reader that:
+pyrss is a small Python RSS reader that:
 - Stores your registered feeds in SQLite
 - Fetches new entries from all feeds (deduplicated)
 - Lets you query entries from a given day
@@ -23,9 +23,9 @@ Install dependency:
 
   pip install feedparser
 
-(Optional) Make it executable:
+Install the CLI (from this repo):
 
-  chmod +x rsscli.py
+  pip install -e .
 
 ------------------------------------------------------------
 Database
@@ -33,11 +33,11 @@ Database
 
 By default the database file is:
 
-  ~/.local/share/rsscli/rss.sqlite3
+  ~/.local/share/pyrss/rss.sqlite3
 
 You can override with:
 
-  python rsscli.py --db /path/to/rss.sqlite3 <command> ...
+  pyrss --db /path/to/rss.sqlite3 <command> ...
 
 Tables:
 - feeds: registered feed URLs + category + metadata
@@ -46,7 +46,7 @@ Tables:
 Notes:
 - Entries are stored with timestamps in UTC (ISO8601).
 - "published_at" comes from the feed when available.
-- "fetched_at" is when rsscli saved it to the DB.
+- "fetched_at" is when pyrss saved it to the DB.
 
 ------------------------------------------------------------
 CLI usage
@@ -54,20 +54,20 @@ CLI usage
 
 1) Add a feed (with optional category)
 
-  python rsscli.py add https://hnrss.org/frontpage dev
-  python rsscli.py add https://planetpython.org/rss20.xml
+  pyrss add https://hnrss.org/frontpage dev
+  pyrss add https://planetpython.org/rss20.xml
   # if category is omitted, it defaults to: "default"
 
 2) List feeds
 
-  python rsscli.py list
+  pyrss list
 
 Output columns:
   <id> <category> <url> <title>
 
 3) Fetch updates from all feeds
 
-  python rsscli.py fetch
+  pyrss fetch
 
 This will:
 - Download feeds
@@ -75,28 +75,28 @@ This will:
 
 4) Show updates for a day (UTC)
 
-  python rsscli.py updates --date 2025-12-23
+  pyrss updates --date 2025-12-23
 
 5) Fetch first, then show updates for a day
 
-  python rsscli.py updates --date 2025-12-23 --fetch-first
+  pyrss updates --date 2025-12-23 --fetch-first
 
 6) If a feed doesn’t have reliable "published" timestamps,
    you can filter by the day entries were fetched:
 
-  python rsscli.py updates --date 2025-12-23 --fetch-first --by-fetched
+  pyrss updates --date 2025-12-23 --fetch-first --by-fetched
 
 
 ------------------------------------------------------------
 Python API usage
 ------------------------------------------------------------
 
-You can import RSSStore from rsscli.py and use it from another script.
+You can import RSSStore from pyrss and use it from another script.
 
 Example:
 
   from datetime import date
-  from rsscli import RSSStore
+  from pyrss import RSSStore
 
   store = RSSStore("/path/to/rss.sqlite3")
 
@@ -123,10 +123,10 @@ Deduplication:
   - hash(title + published)
 
 Timezone:
-- rsscli stores times in UTC for simpler querying and consistent behavior.
+- pyrss stores times in UTC for simpler querying and consistent behavior.
 
 Schema migration:
-- If you created the DB before categories were added, rsscli will attempt
+- If you created the DB before categories were added, pyrss will attempt
   to ALTER the feeds table to add the "category" column automatically.
 
 ------------------------------------------------------------
@@ -135,15 +135,15 @@ Troubleshooting
 
 - "No feeds registered."
   Add at least one feed:
-    python rsscli.py add https://example.com/feed.xml
+    pyrss add https://example.com/feed.xml
 
 - Some feeds show empty "published_at"
   That’s normal for certain feeds. Use:
-    rsscli.py updates --by-fetched
+    pyrss updates --by-fetched
 
 - Feed fetch errors
   Run:
-    python rsscli.py fetch
+    pyrss fetch
   and check the printed error list.
 
 ------------------------------------------------------------
