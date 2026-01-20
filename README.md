@@ -86,16 +86,6 @@ This will:
 
   python rsscli.py updates --date 2025-12-23 --fetch-first --by-fetched
 
-7) Browse the last 50 entries for a feed with fzf and open a link
-
-  python rsscli.py fzf <feed_id>
-
-You can change the number of entries or ordering:
-
-  python rsscli.py fzf <feed_id> --limit 100
-  python rsscli.py fzf <feed_id> --by-fetched
-
-
 ------------------------------------------------------------
 Python API usage
 ------------------------------------------------------------

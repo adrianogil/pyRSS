@@ -16,10 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
-import shutil
 import sqlite3
-import subprocess
-import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -573,19 +570,16 @@ def print_entries_grouped_by_day(entries: List[Entry]) -> None:
         if link:
             print(f"  {link}")
 
-def _sanitize_fzf_field(value: Optional[str]) -> str:
+def _sanitize_tsv_field(value: Optional[str]) -> str:
     if not value:
         return ""
     return value.replace("\t", " ").replace("\n", " ").strip()
 
-def _format_entry_for_fzf(entry: Entry) -> str:
+def _format_entry_tsv(entry: Entry) -> str:
     when = entry.published_at or entry.fetched_at or ""
-    title = _sanitize_fzf_field(entry.title)
-    link = _sanitize_fzf_field(entry.link)
+    title = _sanitize_tsv_field(entry.title)
+    link = _sanitize_tsv_field(entry.link)
     return f"{when}\t{title}\t{link}"
-
-def _open_link(link: str) -> None:
-    webbrowser.open(link, new=2)
 
 def cmd_add(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
@@ -654,11 +648,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     print_entries_grouped_by_day(results)
     return 0
 
-def cmd_fzf(args: argparse.Namespace) -> int:
-    if not shutil.which("fzf"):
-        print("fzf is not installed or not on PATH.")
-        return 2
-
+def cmd_recent(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
 
     if args.fetch_first:
@@ -671,31 +661,8 @@ def cmd_fzf(args: argparse.Namespace) -> int:
         print("No entries found.")
         return 0
 
-    lines = [_format_entry_for_fzf(e) for e in entries]
-    result = subprocess.run(
-        ["fzf", "--delimiter", "\t", "--with-nth", "1,2"],
-        input="\n".join(lines),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        return 0
-
-    selected = result.stdout.strip()
-    if not selected:
-        return 0
-
-    parts = selected.split("\t", 2)
-    link = parts[2].strip() if len(parts) > 2 else ""
-
-    if not link:
-        print("No link available for the selected entry.")
-        return 1
-
-    _open_link(link)
-    print(link)
+    for entry in entries:
+        print(_format_entry_tsv(entry))
     return 0
 
 def build_parser() -> argparse.ArgumentParser:
@@ -732,12 +699,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--fetch-first", action="store_true", help="Fetch before searching")
     p_search.set_defaults(func=cmd_search)
 
-    p_fzf = sub.add_parser("fzf", help="Pick a recent entry from a feed via fzf and open it")
-    p_fzf.add_argument("feed_id", type=int, help="Feed ID to browse")
-    p_fzf.add_argument("--limit", type=int, default=50, help="Number of recent entries to load (default: 50)")
-    p_fzf.add_argument("--fetch-first", action="store_true", help="Fetch before browsing")
-    p_fzf.add_argument("--by-fetched", action="store_true", help="Order by fetched_at instead of published_at")
-    p_fzf.set_defaults(func=cmd_fzf)
+    p_recent = sub.add_parser("recent", help="List recent entries for a feed (TSV)")
+    p_recent.add_argument("feed_id", type=int, help="Feed ID to browse")
+    p_recent.add_argument("--limit", type=int, default=50, help="Number of recent entries to load (default: 50)")
+    p_recent.add_argument("--fetch-first", action="store_true", help="Fetch before listing")
+    p_recent.add_argument("--by-fetched", action="store_true", help="Order by fetched_at instead of published_at")
+    p_recent.set_defaults(func=cmd_recent)
 
     return p
 
