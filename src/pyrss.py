@@ -428,6 +428,44 @@ class RSSStore:
         self.fetch_all()
         return self.get_updates_last_days(days, use_published_at=use_published_at)
 
+    def get_last_entries_for_feed(
+        self,
+        feed_id: int,
+        limit: int = 50,
+        use_published_at: bool = True,
+    ) -> List[Entry]:
+        limit = max(1, min(int(limit), 500))
+        col = "published_at" if use_published_at else "fetched_at"
+        order = f"COALESCE({col}, fetched_at) DESC"
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, feed_id, guid, title, link, author, published_at, summary, content, fetched_at
+                FROM entries
+                WHERE feed_id = ?
+                ORDER BY {order}
+                LIMIT ?
+                """,
+                (int(feed_id), limit),
+            ).fetchall()
+
+            return [
+                Entry(
+                    id=int(r["id"]),
+                    feed_id=int(r["feed_id"]),
+                    guid=str(r["guid"]),
+                    title=r["title"],
+                    link=r["link"],
+                    author=r["author"],
+                    published_at=r["published_at"],
+                    summary=r["summary"],
+                    content=r["content"],
+                    fetched_at=str(r["fetched_at"]),
+                )
+                for r in rows
+            ]
+
     # ---- Search ----
 
     def search(self, query: str, limit: int = 50, category: Optional[str] = None) -> List[Entry]:
@@ -543,6 +581,17 @@ def print_entries_grouped_by_day(entries: List[Entry]) -> None:
         if link:
             print(f"  {link}")
 
+def _sanitize_tsv_field(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return value.replace("\t", " ").replace("\n", " ").strip()
+
+def _format_entry_tsv(entry: Entry) -> str:
+    when = entry.published_at or entry.fetched_at or ""
+    title = _sanitize_tsv_field(entry.title)
+    link = _sanitize_tsv_field(entry.link)
+    return f"{when}\t{title}\t{link}"
+
 def cmd_add(args: argparse.Namespace) -> int:
     store = RSSStore(args.db)
     feed = store.add_feed(args.url, category=args.category, title=None)
@@ -619,6 +668,23 @@ def cmd_search(args: argparse.Namespace) -> int:
     print_entries_grouped_by_day(results)
     return 0
 
+def cmd_recent(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+
+    if args.fetch_first:
+        store.fetch_all()
+
+    use_published = not args.by_fetched
+    entries = store.get_last_entries_for_feed(args.feed_id, limit=args.limit, use_published_at=use_published)
+
+    if not entries:
+        print("No entries found.")
+        return 0
+
+    for entry in entries:
+        print(_format_entry_tsv(entry))
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pyrss", description="SQLite-backed RSS CLI")
     p.add_argument("--db", default=os.path.expanduser("~/.local/share/pyrss/rss.sqlite3"), help="Path to sqlite DB")
@@ -658,6 +724,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--category", default=None, help="Filter by feed category")
     p_search.add_argument("--fetch-first", action="store_true", help="Fetch before searching")
     p_search.set_defaults(func=cmd_search)
+
+    p_recent = sub.add_parser("recent", help="List recent entries for a feed (TSV)")
+    p_recent.add_argument("feed_id", type=int, help="Feed ID to browse")
+    p_recent.add_argument("--limit", type=int, default=50, help="Number of recent entries to load (default: 50)")
+    p_recent.add_argument("--fetch-first", action="store_true", help="Fetch before listing")
+    p_recent.add_argument("--by-fetched", action="store_true", help="Order by fetched_at instead of published_at")
+    p_recent.set_defaults(func=cmd_recent)
 
     return p
 
