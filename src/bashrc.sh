@@ -7,7 +7,7 @@ fi
 
 alias pyrss="python3 ${PYRSS_DIR}/pyrss.py"
 
-pyrss_pick_entry() {
+pyrss-open-entry() {
     local feed_query="$1"
     local feed_line=""
 
