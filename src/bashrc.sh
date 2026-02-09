@@ -7,6 +7,17 @@ fi
 
 alias pyrss="python3 ${PYRSS_DIR}/pyrss.py"
 
+pyrss-db-size() {
+    local db_path="${1:-${PYRSS_DB_PATH:-$HOME/.local/share/pyrss/rss.sqlite3}}"
+
+    if [ ! -e "$db_path" ]; then
+        echo "Database not found at $db_path"
+        return 1
+    fi
+
+    du -sh "$db_path"
+}
+
 pyrss-open-entry() {
     local feed_query="$1"
     local feed_line=""
