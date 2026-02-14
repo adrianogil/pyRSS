@@ -86,6 +86,18 @@ This will:
 
   python rsscli.py updates --date 2025-12-23 --fetch-first --by-fetched
 
+7) Add/list/deactivate/remove per-feed saved filters:
+
+  python rsscli.py filter add 1 "AI + Startups" "ai,startup" --exclude-keywords "funding" --match-fields "title,summary"
+  python rsscli.py filter list --feed-id 1
+  python rsscli.py filter deactivate 2
+  python rsscli.py filter remove 2
+
+8) Keep existing recent listing unchanged, or use filtered listing:
+
+  python rsscli.py recent 1 --limit 20
+  python rsscli.py recent-filtered 1 --limit 20
+
 ------------------------------------------------------------
 Python API usage
 ------------------------------------------------------------
@@ -110,6 +122,11 @@ Other useful methods:
 - store.list_feeds()
 - store.fetch_all()
 - store.get_updates_for_day(day)
+- store.add_feed_filter(...)
+- store.list_feed_filters(...)
+- store.deactivate_feed_filter(filter_id)
+- store.remove_feed_filter(filter_id)
+- store.get_filtered_entries_for_feed(feed_id, limit=50)
 
 ------------------------------------------------------------
 Design choices / notes
