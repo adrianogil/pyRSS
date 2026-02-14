@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -22,12 +23,21 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import feedparser
+import importlib
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
+
+
+def _load_feedparser() -> Any:
+    try:
+        return importlib.import_module("feedparser")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "feedparser is required for fetching feeds. Install it with: pip install feedparser"
+        ) from exc
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -117,6 +127,18 @@ class Entry:
     fetched_at: str              # ISO UTC
 
 
+@dataclass(frozen=True)
+class FeedFilter:
+    id: int
+    feed_id: int
+    name: str
+    include_keywords: List[str]
+    exclude_keywords: List[str]
+    match_fields: List[str]
+    is_case_sensitive: bool
+    is_enabled: bool
+
+
 # -----------------------------
 # SQLite schema
 # -----------------------------
@@ -154,6 +176,23 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_published_at ON entries(published_at);
 CREATE INDEX IF NOT EXISTS idx_entries_fetched_at   ON entries(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_feeds_category       ON feeds(category);
+
+CREATE TABLE IF NOT EXISTS feed_filters (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  feed_id           INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+  name              TEXT NOT NULL,
+  include_keywords  TEXT NOT NULL DEFAULT '[]',
+  exclude_keywords  TEXT NOT NULL DEFAULT '[]',
+  match_fields      TEXT NOT NULL DEFAULT '["title","summary","content"]',
+  is_case_sensitive INTEGER NOT NULL DEFAULT 0,
+  is_enabled        INTEGER NOT NULL DEFAULT 1,
+  created_at        TEXT NOT NULL,
+
+  UNIQUE(feed_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feed_filters_feed_id ON feed_filters(feed_id);
+CREATE INDEX IF NOT EXISTS idx_feed_filters_enabled ON feed_filters(is_enabled);
 """
 
 SCHEMA_FTS_SQL = """
@@ -231,6 +270,13 @@ class RSSStore:
             if "category" not in cols:
                 conn.execute("ALTER TABLE feeds ADD COLUMN category TEXT NOT NULL DEFAULT 'default'")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_feeds_category ON feeds(category)")
+
+            filter_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feed_filters)").fetchall()}
+            if filter_cols:
+                if "is_case_sensitive" not in filter_cols:
+                    conn.execute("ALTER TABLE feed_filters ADD COLUMN is_case_sensitive INTEGER NOT NULL DEFAULT 0")
+                if "is_enabled" not in filter_cols:
+                    conn.execute("ALTER TABLE feed_filters ADD COLUMN is_enabled INTEGER NOT NULL DEFAULT 1")
 
             # Try enable FTS5
             try:
@@ -313,7 +359,7 @@ class RSSStore:
         url = str(feed_row["url"])
         etag = feed_row["etag"]
 
-        d = feedparser.parse(url, etag=etag)
+        d = _load_feedparser().parse(url, etag=etag)
 
         fetched_at = utc_now_iso()
         status = getattr(d, "status", None)
@@ -465,6 +511,171 @@ class RSSStore:
                 )
                 for r in rows
             ]
+
+    # ---- Feed filters ----
+
+    @staticmethod
+    def _parse_keywords(value: str) -> List[str]:
+        raw = (value or "").strip()
+        if not raw:
+            return []
+
+        if raw.startswith("["):
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError("Keywords JSON must be an array.")
+            return [str(v).strip() for v in parsed if str(v).strip()]
+
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    @staticmethod
+    def _parse_match_fields(value: str) -> List[str]:
+        default = ["title", "summary", "content"]
+        raw = (value or "").strip()
+        fields = default if not raw else RSSStore._parse_keywords(raw)
+        valid = {"title", "summary", "content"}
+        normalized = [f.lower() for f in fields]
+        invalid = [f for f in normalized if f not in valid]
+        if invalid:
+            raise ValueError(f"Invalid match_fields: {', '.join(sorted(set(invalid)))}")
+        if not normalized:
+            raise ValueError("match_fields cannot be empty.")
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _filter_from_row(row: sqlite3.Row) -> FeedFilter:
+        return FeedFilter(
+            id=int(row["id"]),
+            feed_id=int(row["feed_id"]),
+            name=str(row["name"]),
+            include_keywords=json.loads(row["include_keywords"]),
+            exclude_keywords=json.loads(row["exclude_keywords"]),
+            match_fields=json.loads(row["match_fields"]),
+            is_case_sensitive=bool(row["is_case_sensitive"]),
+            is_enabled=bool(row["is_enabled"]),
+        )
+
+    def add_feed_filter(
+        self,
+        *,
+        feed_id: int,
+        name: str,
+        include_keywords: str,
+        exclude_keywords: str = "",
+        match_fields: str = "title,summary,content",
+        is_case_sensitive: bool = False,
+    ) -> FeedFilter:
+        filter_name = (name or "").strip()
+        if not filter_name:
+            raise ValueError("Filter name is required.")
+
+        include = self._parse_keywords(include_keywords)
+        if not include:
+            raise ValueError("include_keywords must contain at least one keyword.")
+        exclude = self._parse_keywords(exclude_keywords)
+        fields = self._parse_match_fields(match_fields)
+
+        with self._conn() as conn:
+            exists = conn.execute("SELECT 1 FROM feeds WHERE id = ?", (int(feed_id),)).fetchone()
+            if not exists:
+                raise ValueError(f"Feed id {feed_id} does not exist.")
+
+            conn.execute(
+                """
+                INSERT INTO feed_filters(
+                    feed_id, name, include_keywords, exclude_keywords, match_fields, is_case_sensitive, is_enabled, created_at
+                ) VALUES(?,?,?,?,?,?,1,?)
+                """,
+                (
+                    int(feed_id),
+                    filter_name,
+                    json.dumps(include),
+                    json.dumps(exclude),
+                    json.dumps(fields),
+                    int(bool(is_case_sensitive)),
+                    utc_now_iso(),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT id, feed_id, name, include_keywords, exclude_keywords, match_fields, is_case_sensitive, is_enabled
+                FROM feed_filters
+                WHERE feed_id = ? AND name = ?
+                """,
+                (int(feed_id), filter_name),
+            ).fetchone()
+            if not row:
+                raise RuntimeError("Failed to read newly added filter.")
+            return self._filter_from_row(row)
+
+    def list_feed_filters(self, feed_id: Optional[int] = None, only_enabled: bool = False) -> List[FeedFilter]:
+        where: List[str] = []
+        params: List[Any] = []
+
+        if feed_id is not None:
+            where.append("feed_id = ?")
+            params.append(int(feed_id))
+        if only_enabled:
+            where.append("is_enabled = 1")
+
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, feed_id, name, include_keywords, exclude_keywords, match_fields, is_case_sensitive, is_enabled
+                FROM feed_filters
+                {where_sql}
+                ORDER BY feed_id, id
+                """,
+                params,
+            ).fetchall()
+            return [self._filter_from_row(row) for row in rows]
+
+    def deactivate_feed_filter(self, filter_id: int) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("UPDATE feed_filters SET is_enabled = 0 WHERE id = ?", (int(filter_id),))
+            return int(cur.rowcount)
+
+    def remove_feed_filter(self, filter_id: int) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM feed_filters WHERE id = ?", (int(filter_id),))
+            return int(cur.rowcount)
+
+    def get_filtered_entries_for_feed(self, feed_id: int, limit: int = 50, use_published_at: bool = True) -> List[Entry]:
+        entries = self.get_last_entries_for_feed(feed_id, limit=limit, use_published_at=use_published_at)
+        filters = self.list_feed_filters(feed_id=feed_id, only_enabled=True)
+        if not filters:
+            return entries
+        return [entry for entry in entries if self._entry_matches_any_filter(entry, filters)]
+
+    @staticmethod
+    def _entry_matches_any_filter(entry: Entry, filters: List[FeedFilter]) -> bool:
+        for flt in filters:
+            if RSSStore._entry_matches_filter(entry, flt):
+                return True
+        return False
+
+    @staticmethod
+    def _entry_matches_filter(entry: Entry, flt: FeedFilter) -> bool:
+        chunks: List[str] = []
+        for field in flt.match_fields:
+            value = getattr(entry, field, None)
+            if value:
+                chunks.append(value)
+        haystack = "\n".join(chunks)
+
+        if not flt.is_case_sensitive:
+            haystack = haystack.lower()
+            include = [k.lower() for k in flt.include_keywords]
+            exclude = [k.lower() for k in flt.exclude_keywords]
+        else:
+            include = flt.include_keywords
+            exclude = flt.exclude_keywords
+
+        includes_match = all(keyword in haystack for keyword in include)
+        excludes_match = any(keyword in haystack for keyword in exclude)
+        return includes_match and not excludes_match
 
     # ---- Search ----
 
@@ -685,6 +896,86 @@ def cmd_recent(args: argparse.Namespace) -> int:
         print(_format_entry_tsv(entry))
     return 0
 
+
+def _format_filter_keywords(keywords: List[str]) -> str:
+    return ",".join(keywords)
+
+
+def cmd_filter_add(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+    flt = store.add_feed_filter(
+        feed_id=args.feed_id,
+        name=args.name,
+        include_keywords=args.include_keywords,
+        exclude_keywords=args.exclude_keywords,
+        match_fields=args.match_fields,
+        is_case_sensitive=args.case_sensitive,
+    )
+    print(f"Added filter id={flt.id} feed_id={flt.feed_id} name={flt.name}")
+    return 0
+
+
+def cmd_filter_list(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+    filters = store.list_feed_filters(feed_id=args.feed_id, only_enabled=args.enabled_only)
+    if not filters:
+        print("No filters found.")
+        return 0
+
+    for flt in filters:
+        print(
+            "\t".join(
+                [
+                    str(flt.id),
+                    str(flt.feed_id),
+                    flt.name,
+                    _format_filter_keywords(flt.include_keywords),
+                    _format_filter_keywords(flt.exclude_keywords),
+                    _format_filter_keywords(flt.match_fields),
+                    "1" if flt.is_case_sensitive else "0",
+                    "1" if flt.is_enabled else "0",
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_filter_deactivate(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+    changed = store.deactivate_feed_filter(args.filter_id)
+    if changed == 0:
+        print("No matching filter found.")
+        return 1
+    print(f"Deactivated {changed} filter(s).")
+    return 0
+
+
+def cmd_filter_remove(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+    changed = store.remove_feed_filter(args.filter_id)
+    if changed == 0:
+        print("No matching filter found.")
+        return 1
+    print(f"Removed {changed} filter(s).")
+    return 0
+
+
+def cmd_recent_filtered(args: argparse.Namespace) -> int:
+    store = RSSStore(args.db)
+
+    if args.fetch_first:
+        store.fetch_all()
+
+    use_published = not args.by_fetched
+    entries = store.get_filtered_entries_for_feed(args.feed_id, limit=args.limit, use_published_at=use_published)
+    if not entries:
+        print("No entries found.")
+        return 0
+
+    for entry in entries:
+        print(_format_entry_tsv(entry))
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pyrss", description="SQLite-backed RSS CLI")
     p.add_argument("--db", default=os.path.expanduser("~/.local/share/pyrss/rss.sqlite3"), help="Path to sqlite DB")
@@ -731,6 +1022,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_recent.add_argument("--fetch-first", action="store_true", help="Fetch before listing")
     p_recent.add_argument("--by-fetched", action="store_true", help="Order by fetched_at instead of published_at")
     p_recent.set_defaults(func=cmd_recent)
+
+    p_recent_filtered = sub.add_parser("recent-filtered", help="List recent entries for a feed after applying active feed filters (TSV)")
+    p_recent_filtered.add_argument("feed_id", type=int, help="Feed ID to browse")
+    p_recent_filtered.add_argument("--limit", type=int, default=50, help="Number of recent entries to load (default: 50)")
+    p_recent_filtered.add_argument("--fetch-first", action="store_true", help="Fetch before listing")
+    p_recent_filtered.add_argument("--by-fetched", action="store_true", help="Order by fetched_at instead of published_at")
+    p_recent_filtered.set_defaults(func=cmd_recent_filtered)
+
+    p_filter = sub.add_parser("filter", help="Manage saved feed filters")
+    sub_filter = p_filter.add_subparsers(dest="filter_cmd", required=True)
+
+    p_filter_add = sub_filter.add_parser("add", help="Add a saved filter for a feed")
+    p_filter_add.add_argument("feed_id", type=int, help="Feed ID")
+    p_filter_add.add_argument("name", help="Friendly filter name")
+    p_filter_add.add_argument("include_keywords", help="Keywords to include (comma-separated or JSON array)")
+    p_filter_add.add_argument("--exclude-keywords", default="", help="Keywords to exclude (comma-separated or JSON array)")
+    p_filter_add.add_argument("--match-fields", default="title,summary,content", help="Fields to search in: any of title,summary,content")
+    p_filter_add.add_argument("--case-sensitive", action="store_true", help="Case-sensitive keyword matching")
+    p_filter_add.set_defaults(func=cmd_filter_add)
+
+    p_filter_list = sub_filter.add_parser("list", help="List saved filters")
+    p_filter_list.add_argument("--feed-id", type=int, default=None, help="Optional feed ID")
+    p_filter_list.add_argument("--enabled-only", action="store_true", help="Show only enabled filters")
+    p_filter_list.set_defaults(func=cmd_filter_list)
+
+    p_filter_deactivate = sub_filter.add_parser("deactivate", help="Disable a filter by id")
+    p_filter_deactivate.add_argument("filter_id", type=int)
+    p_filter_deactivate.set_defaults(func=cmd_filter_deactivate)
+
+    p_filter_remove = sub_filter.add_parser("remove", help="Remove a filter by id")
+    p_filter_remove.add_argument("filter_id", type=int)
+    p_filter_remove.set_defaults(func=cmd_filter_remove)
 
     return p
 
